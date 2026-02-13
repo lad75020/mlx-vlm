@@ -2,15 +2,34 @@ import argparse
 import json
 import logging
 import os
+import sys
+from pathlib import Path
+
+# Prefer importing the *local* mlx_vlm package (next to this script) rather than
+# an installed site-packages version.
+_repo_root = Path(__file__).resolve().parents[1]
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
+
+# Work around occasional brotli decoder crashes seen in some aiohttp/httpx stacks
+# (e.g. during dataset/image fetching in multiprocessing). Disabling aiohttp
+# optional C-extensions prevents brotli usage.
+os.environ.setdefault("AIOHTTP_NO_EXTENSIONS", "1")
 
 import mlx.optimizers as optim
 from datasets import load_dataset
 from tqdm import tqdm
 
-from .prompt_utils import apply_chat_template
-from .trainer import Dataset, Trainer, save_adapter
-from .trainer.utils import apply_lora_layers, find_all_linear_names, get_peft_model
-from .utils import load, load_image_processor
+# NOTE: this file is being run as a standalone script (e.g. `python lora.py`).
+# Relative imports (from .something import ...) only work when executed as a package
+# module (e.g. `python -m mlx_vlm.lora`).
+#
+# To make this script runnable from arbitrary locations, we import from the
+# installed `mlx_vlm` package instead.
+from mlx_vlm.prompt_utils import apply_chat_template
+from mlx_vlm.trainer import Dataset, Trainer, save_adapter
+from mlx_vlm.trainer.utils import apply_lora_layers, find_all_linear_names, get_peft_model
+from mlx_vlm.utils import load, load_image_processor
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -29,12 +48,47 @@ def main(args):
     image_processor = load_image_processor(args.model_path)
 
     logger.info(f"\033[32mLoading dataset from {args.dataset}\033[0m")
-    dataset = load_dataset(args.dataset, split=args.split)
+    # Hugging Face Datasets will materialize Arrow caches; large datasets (e.g. ImageNet)
+    # can easily exceed free space on the system drive. Allow overriding the cache dir.
+    dataset = load_dataset(args.dataset, split=args.split, cache_dir=args.cache_dir)
 
-    if "messages" not in dataset.column_names:
-        raise ValueError("Dataset must have a 'messages' column")
-    if "images" not in dataset.column_names:
-        raise ValueError("Dataset must have an 'images' column")
+    # Expected columns for mlx-vlm LoRA training are typically:
+    # - messages (or conversations): chat-style supervision
+    # - images (or image): image(s) per example
+    #
+    # Some datasets (e.g. ImageNet) have `label` + `image` instead. In that case we
+    # synthesize a minimal chat conversation from the label.
+    if "messages" not in dataset.column_names and "conversations" not in dataset.column_names:
+        if "label" in dataset.column_names:
+            logger.warning(
+                "Dataset has no 'messages' column; found 'label'. Synthesizing messages from label."
+            )
+
+            def label_to_messages(example):
+                # Try to turn ClassLabel -> string name if available
+                label_val = example.get("label")
+                try:
+                    feat = dataset.features.get("label")
+                    if hasattr(feat, "int2str"):
+                        label_text = feat.int2str(label_val)
+                    else:
+                        label_text = str(label_val)
+                except Exception:
+                    label_text = str(label_val)
+
+                # Minimal chat format: user asks about the image; assistant answers label.
+                example["messages"] = [
+                    {"role": "user", "content": "Describe the image."},
+                    {"role": "assistant", "content": label_text},
+                ]
+                return example
+
+            dataset = dataset.map(label_to_messages)
+        else:
+            raise ValueError("Dataset must have a 'messages'/'conversations' column (or a 'label' column to synthesize messages)")
+
+    if "images" not in dataset.column_names and "image" not in dataset.column_names:
+        raise ValueError("Dataset must have an 'images' or 'image' column")
 
     if args.apply_chat_template:
         logger.info(f"\033[32mApplying chat template to the dataset\033[0m")
@@ -59,7 +113,23 @@ def main(args):
                 )
             return examples
 
-        dataset = dataset.map(process_data)
+        # HF Datasets map() is single-process by default. Use num_proc>1 to
+        # parallelize CPU-bound preprocessing (JSON/template formatting).
+        num_proc = args.num_proc
+        if num_proc == 0:
+            num_proc = os.cpu_count() or 1
+        try:
+            dataset = dataset.map(
+                process_data,
+                num_proc=num_proc if num_proc > 1 else None,
+            )
+        except Exception as e:
+            logger.warning(
+                "dataset.map() failed (num_proc=%s): %s. Retrying single-process.",
+                num_proc,
+                e,
+            )
+            dataset = dataset.map(process_data, num_proc=None)
 
     dataset = Dataset(
         dataset,
@@ -145,6 +215,15 @@ if __name__ == "__main__":
         "--dataset", type=str, required=True, help="Path to the dataset"
     )
     parser.add_argument(
+        "--cache-dir",
+        type=str,
+        default=None,
+        help=(
+            "Cache directory for Hugging Face Datasets (Arrow cache, downloads). "
+            "Use a drive with lots of free space (e.g. /Volumes/QuadX/...)."
+        ),
+    )
+    parser.add_argument(
         "--split", type=str, default="train", help="Split to use for training"
     )
     parser.add_argument(
@@ -201,6 +280,15 @@ if __name__ == "__main__":
         "--save-after-epoch",
         action="store_true",
         help="Save interim versions of adapter files after each epoch",
+    )
+    parser.add_argument(
+        "--num-proc",
+        type=int,
+        default=0,
+        help=(
+            "Number of processes for HF Datasets preprocessing (dataset.map). "
+            "0 = auto (os.cpu_count()), 1 = disable multiprocessing."
+        ),
     )
 
     args = parser.parse_args()

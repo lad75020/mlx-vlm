@@ -475,7 +475,10 @@ def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> ProcessorMixin:
 
-    processor = AutoProcessor.from_pretrained(model_path, use_fast=True, **kwargs)
+    # The "fast" image processors in Transformers currently only support returning
+    # PyTorch tensors and can also have missing metadata (e.g. patch_size) for some
+    # models, which breaks preprocessing. Prefer the non-fast processor.
+    processor = AutoProcessor.from_pretrained(model_path, use_fast=False, **kwargs)
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
 
@@ -850,6 +853,9 @@ def process_inputs(
 
     for param in parameters.keys():
         if param in kwargs.keys():
+            # Don't let kwargs override return_tensors; the fallback logic depends on it.
+            if param == "return_tensors":
+                continue
             args[param] = kwargs.get(param, None)
 
     # Add audio if provided and supported
