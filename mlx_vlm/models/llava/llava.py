@@ -3,11 +3,79 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from PIL import Image
+from transformers.image_transforms import (
+    convert_to_rgb,
+    normalize,
+    rescale,
+    resize,
+    to_channel_dimension_format,
+)
+from transformers.image_utils import to_numpy_array
 
-from ..base import InputEmbeddingsFeatures
+from ..base import BaseImageProcessor, InputEmbeddingsFeatures
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
+
+
+class ImageProcessor(BaseImageProcessor):
+    """Image processor for LLaVA models.
+
+    mlx-vlm's training pipeline expects a BaseImageProcessor so that it can
+    deterministically build MLX pixel_values and expand <image> placeholders.
+    """
+
+    def __init__(self, config=None, **kwargs):
+        # Prefer model config image size when available (e.g. 336 for LLaVA-1.5)
+        if config is not None:
+            try:
+                img_size = (
+                    (config.get("vision_config", {}) or {}).get("image_size", None)
+                )
+                if img_size is not None:
+                    kwargs.setdefault("size", (int(img_size), int(img_size)))
+                    kwargs.setdefault(
+                        "crop_size",
+                        {"height": int(img_size), "width": int(img_size)},
+                    )
+            except Exception:
+                pass
+        super().__init__(**kwargs)
+
+    def preprocess(self, images):
+        if isinstance(images, Image.Image):
+            images = [images]
+        else:
+            assert isinstance(images, list)
+
+        from functools import partial, reduce
+
+        transforms = [
+            convert_to_rgb,
+            to_numpy_array,
+            partial(
+                resize,
+                size=self.size,
+                resample=self.resample,
+                data_format=self.data_format,
+            ),
+            partial(rescale, scale=self.rescale_factor, data_format=self.data_format),
+            partial(
+                normalize,
+                mean=self.image_mean,
+                std=self.image_std,
+                data_format=self.data_format,
+            ),
+            partial(
+                to_channel_dimension_format,
+                channel_dim=self.data_format,
+                input_channel_dim=self.data_format,
+            ),
+        ]
+
+        images = reduce(lambda x, f: [*map(f, x)], transforms, images)
+        return images
 
 
 class LlavaMultiModalProjector(nn.Module):
@@ -87,27 +155,27 @@ class Model(nn.Module):
     ):
         image_token_index = self.config.image_token_index
 
-        # Positions of <image> tokens in input_ids, assuming batch size is 1
-        image_positions = np.where(input_ids == image_token_index)[1].tolist()
-        num_images, _, vision_hidden_size = image_features.shape
-
-        reshaped_image_hidden_states = image_features.reshape(-1, vision_hidden_size)
+        # Positions of <image> tokens in input_ids.
+        # Support batching: image_features is (B, T_img, H) and input_ids is (B, S).
+        batch_size, t_img, vision_hidden_size = image_features.shape
 
         # cast to the dtype of the input_embeds to support quantized models
-        reshaped_image_hidden_states = reshaped_image_hidden_states.astype(
-            inputs_embeds.dtype
-        )
+        image_features = image_features.astype(inputs_embeds.dtype)
 
-        # Pad image_positions to match the length of reshaped_image_hidden_states
-        num_positions_needed = len(image_positions)
+        # For each sample in the batch, replace the <image> token positions with
+        # the projected image features.
+        for b in range(batch_size):
+            # input_ids[b] is (S,). np.where returns tuple with one array.
+            image_positions = np.where(np.array(input_ids[b]) == image_token_index)[0]
 
-        if reshaped_image_hidden_states.shape[0] > num_positions_needed:
-            # TODO: Think about how to handle this case
-            raise ValueError(
-                "Llava model supports only one image per input. Please check your input_ids and pixel_values."
-            )
+            if len(image_positions) != t_img:
+                raise ValueError(
+                    f"Llava expected {t_img} <image> tokens for sample {b}, got {len(image_positions)}. "
+                    "This usually means the text prompt wasn't expanded to match the number of image tokens."
+                )
 
-        inputs_embeds[:, image_positions, :] = reshaped_image_hidden_states
+            inputs_embeds[b, image_positions.tolist(), :] = image_features[b]
+
         return inputs_embeds
 
     @property

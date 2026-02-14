@@ -1,8 +1,10 @@
 import argparse
+import hashlib
 import json
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 # Prefer importing the *local* mlx_vlm package (next to this script) rather than
@@ -17,7 +19,7 @@ if str(_repo_root) not in sys.path:
 os.environ.setdefault("AIOHTTP_NO_EXTENSIONS", "1")
 
 import mlx.optimizers as optim
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from tqdm import tqdm
 
 # NOTE: this file is being run as a standalone script (e.g. `python lora.py`).
@@ -35,11 +37,88 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def _default_progress_dir() -> Path:
+    # Keep progress state next to this script (as requested)
+    return Path(__file__).resolve().parent / ".lora_progress"
+
+
+def _run_key(args) -> str:
+    # A stable-ish key for the preprocessing pipeline. If any of these change,
+    # we should recompute maps.
+    payload = {
+        "dataset": args.dataset,
+        "split": args.split,
+        "model_path": args.model_path,
+        "apply_chat_template": bool(args.apply_chat_template),
+        "image_resize_shape": args.image_resize_shape,
+    }
+    s = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:12]
+
+
+def _progress_paths(args):
+    pdir = Path(args.progress_dir) if args.progress_dir else _default_progress_dir()
+    pdir.mkdir(parents=True, exist_ok=True)
+    key = _run_key(args)
+    run_dir = pdir / key
+    run_dir.mkdir(parents=True, exist_ok=True)
+    progress_file = run_dir / "progress.json"
+    return key, run_dir, progress_file
+
+
+def _load_progress(progress_file: Path) -> dict:
+    if progress_file.exists():
+        try:
+            return json.loads(progress_file.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_progress(progress_file: Path, state: dict) -> None:
+    state = dict(state)
+    state["updated_at"] = time.time()
+    tmp = progress_file.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(progress_file)
+
+
+def _mark_done(progress_file: Path, state: dict, step: str, **extra) -> dict:
+    done = set(state.get("done", []))
+    done.add(step)
+    state["done"] = sorted(done)
+    for k, v in extra.items():
+        state[k] = v
+    _save_progress(progress_file, state)
+    return state
+
+
 def custom_print(*args, **kwargs):
     tqdm.write(" ".join(map(str, args)), **kwargs)
 
 
 def main(args):
+    run_key, run_dir, progress_file = _progress_paths(args)
+    state = _load_progress(progress_file)
+    state.setdefault("run_key", run_key)
+    state.setdefault("args", {})
+    # Store a lightweight snapshot of args for humans.
+    state["args"].update(
+        {
+            "dataset": args.dataset,
+            "split": args.split,
+            "model_path": args.model_path,
+            "cache_dir": args.cache_dir,
+            "apply_chat_template": bool(args.apply_chat_template),
+            "num_proc": args.num_proc,
+            "batch_size": args.batch_size,
+            "epochs": args.epochs,
+        }
+    )
+    _save_progress(progress_file, state)
+
+    logger.info(f"\033[32mProgress file: {progress_file}\033[0m")
+
     logger.info(f"\033[32mLoading model from {args.model_path}\033[0m")
     model, processor = load(
         args.model_path, processor_config={"trust_remote_code": True}
@@ -47,10 +126,28 @@ def main(args):
     config = model.config.__dict__
     image_processor = load_image_processor(args.model_path)
 
-    logger.info(f"\033[32mLoading dataset from {args.dataset}\033[0m")
-    # Hugging Face Datasets will materialize Arrow caches; large datasets (e.g. ImageNet)
-    # can easily exceed free space on the system drive. Allow overriding the cache dir.
-    dataset = load_dataset(args.dataset, split=args.split, cache_dir=args.cache_dir)
+    # ---- Dataset preprocessing with restartable checkpoints ----
+    label_ckpt = run_dir / "dataset_after_label_messages"
+    chat_ckpt = run_dir / "dataset_after_chat_template"
+
+    if args.resume_progress and chat_ckpt.exists():
+        logger.info(
+            f"\033[32mResuming from checkpoint: {chat_ckpt}\033[0m"
+        )
+        dataset = load_from_disk(str(chat_ckpt))
+        state = _mark_done(progress_file, state, "loaded_checkpoint_chat_template")
+    elif args.resume_progress and label_ckpt.exists():
+        logger.info(
+            f"\033[32mResuming from checkpoint: {label_ckpt}\033[0m"
+        )
+        dataset = load_from_disk(str(label_ckpt))
+        state = _mark_done(progress_file, state, "loaded_checkpoint_label_messages")
+    else:
+        logger.info(f"\033[32mLoading dataset from {args.dataset}\033[0m")
+        # Hugging Face Datasets will materialize Arrow caches; large datasets (e.g. ImageNet)
+        # can easily exceed free space on the system drive. Allow overriding the cache dir.
+        dataset = load_dataset(args.dataset, split=args.split, cache_dir=args.cache_dir)
+        state = _mark_done(progress_file, state, "loaded_raw_dataset")
 
     # Expected columns for mlx-vlm LoRA training are typically:
     # - messages (or conversations): chat-style supervision
@@ -84,6 +181,16 @@ def main(args):
                 return example
 
             dataset = dataset.map(label_to_messages)
+            # Checkpoint after generating messages so we can restart quickly.
+            if args.save_progress:
+                logger.info(f"\033[32mSaving checkpoint: {label_ckpt}\033[0m")
+                dataset.save_to_disk(str(label_ckpt))
+                state = _mark_done(
+                    progress_file,
+                    state,
+                    "checkpoint_after_label_messages",
+                    checkpoint_after_label_messages=str(label_ckpt),
+                )
         else:
             raise ValueError("Dataset must have a 'messages'/'conversations' column (or a 'label' column to synthesize messages)")
 
@@ -130,6 +237,17 @@ def main(args):
                 e,
             )
             dataset = dataset.map(process_data, num_proc=None)
+
+        # Checkpoint after applying chat template so we can restart quickly.
+        if args.save_progress:
+            logger.info(f"\033[32mSaving checkpoint: {chat_ckpt}\033[0m")
+            dataset.save_to_disk(str(chat_ckpt))
+            state = _mark_done(
+                progress_file,
+                state,
+                "checkpoint_after_chat_template",
+                checkpoint_after_chat_template=str(chat_ckpt),
+            )
 
     dataset = Dataset(
         dataset,
@@ -288,6 +406,32 @@ if __name__ == "__main__":
         help=(
             "Number of processes for HF Datasets preprocessing (dataset.map). "
             "0 = auto (os.cpu_count()), 1 = disable multiprocessing."
+        ),
+    )
+
+    # Progress / restartability
+    parser.add_argument(
+        "--progress-dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory to store restart checkpoints and a progress.json file. "
+            "Defaults to <folder of lora.py>/.lora_progress"
+        ),
+    )
+    parser.add_argument(
+        "--save-progress",
+        action="store_true",
+        help=(
+            "Save restart checkpoints after major preprocessing steps (dataset.map stages). "
+            "Recommended for large datasets."
+        ),
+    )
+    parser.add_argument(
+        "--resume-progress",
+        action="store_true",
+        help=(
+            "Resume from the latest saved preprocessing checkpoint if present."
         ),
     )
 

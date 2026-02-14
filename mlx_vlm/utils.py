@@ -479,6 +479,26 @@ def load_processor(
     # PyTorch tensors and can also have missing metadata (e.g. patch_size) for some
     # models, which breaks preprocessing. Prefer the non-fast processor.
     processor = AutoProcessor.from_pretrained(model_path, use_fast=False, **kwargs)
+
+    # Some checkpoints (incl. LLaVA conversions) may omit patch_size from the
+    # preprocessor/processor configs. Transformers' LlavaProcessor relies on it
+    # to compute the number of image tokens.
+    if getattr(processor, "patch_size", None) is None:
+        try:
+            cfg = load_config(model_path, **kwargs)
+            patch_size = (
+                cfg.get("vision_config", {}) or {}
+            ).get("patch_size", None)
+            if patch_size is not None:
+                processor.patch_size = patch_size
+                if getattr(processor, "image_processor", None) is not None and getattr(
+                    processor.image_processor, "patch_size", None
+                ) is None:
+                    processor.image_processor.patch_size = patch_size
+        except Exception:
+            # Best-effort only; some processors don't use patch_size.
+            pass
+
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
 
@@ -1076,20 +1096,56 @@ def prepare_inputs(
 
         if processor.pad_token is None:
             processor.pad_token = processor.eos_token
-        text_chunks = [
-            [processor(chunk).input_ids for chunk in prompt.split("<image>")]
-            for prompt in prompts
-        ]
+
+        # LLaVA expects the prompt to contain *as many* image placeholder tokens as
+        # the number of image features produced by the vision tower.
+        # For LLaVA-1.5 with image_size=336 and patch_size=14, this is 24*24=576.
+        processor_class_name = (
+            processor.__class__.__name__ if hasattr(processor, "__class__") else ""
+        )
+        is_llava = processor_class_name.lower().startswith("llava")
+
+        num_image_tokens = 1
+        if is_llava:
+            size = getattr(processor.image_processor, "size", None)
+            patch = getattr(processor, "patch_size", None)
+            try:
+                if isinstance(size, dict):
+                    # CLIP processors usually store "shortest_edge" for square resize.
+                    img_size = size.get("shortest_edge") or size.get("height") or size.get("width")
+                elif isinstance(size, int):
+                    img_size = size
+                elif isinstance(size, tuple):
+                    img_size = size[0]
+                else:
+                    img_size = None
+
+                if img_size is not None and patch is not None:
+                    grid = int(img_size) // int(patch)
+                    num_image_tokens = grid * grid
+                else:
+                    num_image_tokens = 576
+            except Exception:
+                num_image_tokens = 576
+
+        # Tokenize text around the <image> placeholder. If it's missing, inject one.
+        text_chunks = []
+        for prompt in prompts:
+            parts = prompt.split("<image>")
+            if len(parts) == 1:
+                parts = [parts[0], ""]
+            chunks = [processor(part).input_ids for part in parts]
+            text_chunks.append(chunks)
 
         # Find the maximum length for padding
         max_length = max(
-            sum(len(chunk) for chunk in chunks) + 1 for chunks in text_chunks
+            sum(len(chunk) for chunk in chunks) + num_image_tokens for chunks in text_chunks
         )
 
         # Pad and create input_ids
         input_ids = []
         for chunks in text_chunks:
-            ids = chunks[0] + [image_token_index] + chunks[1]
+            ids = chunks[0] + ([image_token_index] * num_image_tokens) + chunks[1]
             padding = [processor.pad_token_id] * (max_length - len(ids))
             input_ids.append(mx.array(ids + padding))
 
