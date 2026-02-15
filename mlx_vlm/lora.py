@@ -135,12 +135,14 @@ def main(args):
             f"\033[32mResuming from checkpoint: {chat_ckpt}\033[0m"
         )
         dataset = load_from_disk(str(chat_ckpt))
+        state["loaded_from_disk"] = str(chat_ckpt)
         state = _mark_done(progress_file, state, "loaded_checkpoint_chat_template")
     elif args.resume_progress and label_ckpt.exists():
         logger.info(
             f"\033[32mResuming from checkpoint: {label_ckpt}\033[0m"
         )
         dataset = load_from_disk(str(label_ckpt))
+        state["loaded_from_disk"] = str(label_ckpt)
         state = _mark_done(progress_file, state, "loaded_checkpoint_label_messages")
     else:
         logger.info(f"\033[32mLoading dataset from {args.dataset}\033[0m")
@@ -240,13 +242,19 @@ def main(args):
 
         # Checkpoint after applying chat template so we can restart quickly.
         if args.save_progress:
-            logger.info(f"\033[32mSaving checkpoint: {chat_ckpt}\033[0m")
-            dataset.save_to_disk(str(chat_ckpt))
+            # Avoid trying to overwrite the dataset if it was loaded from the same path.
+            save_path = chat_ckpt
+            loaded_from = state.get("loaded_from_disk", None)
+            if loaded_from and Path(loaded_from).resolve() == Path(chat_ckpt).resolve():
+                save_path = run_dir / "dataset_after_chat_template_v2"
+
+            logger.info(f"\033[32mSaving checkpoint: {save_path}\033[0m")
+            dataset.save_to_disk(str(save_path))
             state = _mark_done(
                 progress_file,
                 state,
                 "checkpoint_after_chat_template",
-                checkpoint_after_chat_template=str(chat_ckpt),
+                checkpoint_after_chat_template=str(save_path),
             )
 
     dataset = Dataset(

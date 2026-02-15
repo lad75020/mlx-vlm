@@ -1094,8 +1094,13 @@ def prepare_inputs(
         if not isinstance(prompts, list):
             prompts = [prompts]
 
-        if processor.pad_token is None:
-            processor.pad_token = processor.eos_token
+        # Some processors (e.g. LlavaProcessor) don't expose pad_token directly.
+        tokenizer = getattr(processor, "tokenizer", processor)
+        if getattr(tokenizer, "pad_token", None) is None:
+            tokenizer.pad_token = getattr(tokenizer, "eos_token", None)
+            # Keep processor in sync when it mirrors tokenizer fields.
+            if hasattr(processor, "pad_token"):
+                processor.pad_token = tokenizer.pad_token
 
         # LLaVA expects the prompt to contain *as many* image placeholder tokens as
         # the number of image features produced by the vision tower.
@@ -1134,7 +1139,10 @@ def prepare_inputs(
             parts = prompt.split("<image>")
             if len(parts) == 1:
                 parts = [parts[0], ""]
-            chunks = [processor(part).input_ids for part in parts]
+            # Tokenize text-only parts. Use tokenizer directly to avoid calling
+            # multimodal processor.__call__ (which expects a callable HF image_processor).
+            tok = getattr(processor, "tokenizer", processor)
+            chunks = [tok(part).input_ids for part in parts]
             text_chunks.append(chunks)
 
         # Find the maximum length for padding
@@ -1146,14 +1154,21 @@ def prepare_inputs(
         input_ids = []
         for chunks in text_chunks:
             ids = chunks[0] + ([image_token_index] * num_image_tokens) + chunks[1]
-            padding = [processor.pad_token_id] * (max_length - len(ids))
+            pad_id = getattr(processor, "pad_token_id", None)
+            if pad_id is None:
+                pad_id = getattr(getattr(processor, "tokenizer", processor), "pad_token_id", None)
+            if pad_id is None:
+                # Last resort: use eos as pad
+                pad_id = getattr(getattr(processor, "tokenizer", processor), "eos_token_id", None)
+
+            padding = [pad_id] * (max_length - len(ids))
             input_ids.append(mx.array(ids + padding))
 
         model_inputs["input_ids"] = mx.array(input_ids)
         pixel_values = processor.image_processor.preprocess(images=images)
         model_inputs["pixel_values"] = mx.array(np.stack(pixel_values))
         model_inputs["attention_mask"] = mx.array(
-            [(ids != processor.pad_token_id) for ids in input_ids]
+            [(ids != pad_id) for ids in input_ids]
         ).astype(mx.int32)
 
     else:
